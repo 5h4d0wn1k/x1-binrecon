@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """X1 - Binary Recon Tool (binrecon)
 
-Static binary triage: ELF/PE header parsing, entropy, packer heuristics,
-string extraction, and patch-diff mode. Pure stdlib (struct only).
+Static binary triage: ELF/PE header parsing, section/symbol/dynamic-import
+enumeration, Shannon entropy mapping, packer heuristics and string extraction.
+
+The analyzer parses *real* binaries (e.g. an ELF you compile with gcc). The
+--demo path compiles samples/vuln.c when a compiler is present, parses the
+resulting ELF and emits a recon JSON report into reports/.
+
+Pure stdlib (struct only). Run ``--help`` for the CLI, ``--demo`` for the
+offline end-to-end verification path.
 """
 
 import struct
 import math
 import sys
 import os
+import json
 import argparse
+import subprocess
 
 # ---------------------------------------------------------------------------
 # ELF constants
@@ -37,6 +46,11 @@ SHT_TYPES = {
     11: "DYNSYM",
 }
 SHT_FLAGS = {0x1: "W", 0x2: "A", 0x4: "X", 0x10: "M", 0x20: "I", 0x40: "S"}
+
+STT_FUNC = 2
+SHN_UNDEF = 0
+DT_NULL = 0
+DT_NEEDED = 1
 
 # ---------------------------------------------------------------------------
 # PE constants
@@ -77,7 +91,17 @@ def shannon_entropy(data):
 def entropy_bar(ent, width=16):
     """Return a visual bar for entropy."""
     filled = int(ent / 8.0 * width)
-    return "█" * filled + "░" * (width - filled)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def _cstr(buf, idx):
+    """Read a NUL-terminated string from a byte buffer starting at idx."""
+    if idx < 0 or idx >= len(buf):
+        return ""
+    end = buf.find(b"\x00", idx)
+    if end == -1:
+        end = len(buf)
+    return buf[idx:end].decode("ascii", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +113,9 @@ class ELFParser:
     def __init__(self, data):
         self.data = data
         self.sections = []
+        self.symbols = []
+        self.imports = []
+        self.needed_libs = []
         self.header = {}
         self._parse()
 
@@ -104,6 +131,8 @@ class ELFParser:
             self._parse32()
         else:
             raise ValueError(f"Unknown ELF class: {self.cls}")
+        self._extract_symbols()
+        self._extract_needed_libs()
 
     def _parse32(self):
         e = self.endian
@@ -133,28 +162,23 @@ class ELFParser:
         if shnum == 0 or shoff == 0:
             return
         strtab_hdr_off = shoff + shstrndx * shentsize
-        if strtab_hdr_off + 24 > len(self.data):
+        if strtab_hdr_off + 40 > len(self.data):
             return
-        # ELF32 section header: sh_offset at +16, sh_size at +20
         strtab_start = struct.unpack_from(self.endian + "I", self.data, strtab_hdr_off + 16)[0]
         strtab_size = struct.unpack_from(self.endian + "I", self.data, strtab_hdr_off + 20)[0]
-        if strtab_size == 0 or strtab_start + strtab_size > len(self.data):
-            return
-        strtab = self.data[strtab_start:strtab_start + strtab_size]
+        strtab = b""
+        if strtab_size and strtab_start + strtab_size <= len(self.data):
+            strtab = self.data[strtab_start:strtab_start + strtab_size]
         for i in range(shnum):
             off = shoff + i * shentsize
-            if off + shentsize > len(self.data):
+            if off + 40 > len(self.data):
                 break
-            s = struct.unpack_from(self.endian + "IIIIIIII", self.data, off)
-            name_idx = s[0]
-            name = ""
-            if name_idx < len(strtab):
-                end = strtab.index(b'\x00', name_idx) if b'\x00' in strtab[name_idx:] else len(strtab)
-                name = strtab[name_idx:end].decode("ascii", errors="replace")
+            s = struct.unpack_from(self.endian + "IIIIIIIII", self.data, off)
+            name = _cstr(strtab, s[0]) if s[0] < len(strtab) else ""
             self.sections.append({
                 "name": name, "type": SHT_TYPES.get(s[1], f"0x{s[1]:x}"),
-                "flags": s[2], "addr": s[3], "offset": s[4],
-                "size": s[5], "ent_size": s[7],
+                "flags": s[2], "addr": s[3], "offset": s[4], "size": s[5],
+                "link": s[6], "info": s[7], "entsize": s[8],
             })
 
     def _parse_sections64(self, shentsize, shnum, shstrndx, shoff):
@@ -163,28 +187,92 @@ class ELFParser:
         strtab_hdr_off = shoff + shstrndx * shentsize
         if strtab_hdr_off + 64 > len(self.data):
             return
-        # ELF64 section header: sh_offset at byte 24, sh_size at byte 32
         strtab_file_off = struct.unpack_from(self.endian + "Q", self.data, strtab_hdr_off + 24)[0]
         strtab_size = struct.unpack_from(self.endian + "Q", self.data, strtab_hdr_off + 32)[0]
-        if strtab_size == 0 or strtab_file_off == 0 or strtab_file_off + strtab_size > len(self.data):
-            return
-        strtab = self.data[strtab_file_off:strtab_file_off + strtab_size]
+        strtab = b""
+        if strtab_size and strtab_file_off and strtab_file_off + strtab_size <= len(self.data):
+            strtab = self.data[strtab_file_off:strtab_file_off + strtab_size]
         for i in range(shnum):
             off = shoff + i * shentsize
             if off + 64 > len(self.data):
                 break
             s = struct.unpack_from(self.endian + "IIQQQQIIQQ", self.data, off)
-            name_idx = s[0]
-            name = ""
-            if name_idx < len(strtab):
-                end = strtab.index(b'\x00', name_idx) if b'\x00' in strtab[name_idx:] else len(strtab)
-                name = strtab[name_idx:end].decode("ascii", errors="replace")
-            flags = s[3]
+            name = _cstr(strtab, s[0]) if s[0] < len(strtab) else ""
             self.sections.append({
                 "name": name, "type": SHT_TYPES.get(s[1], f"0x{s[1]:x}"),
-                "flags": s[2], "addr": s[3], "offset": s[4],
-                "size": s[5], "ent_size": s[8],
+                "flags": s[2], "addr": s[3], "offset": s[4], "size": s[5],
+                "link": s[6], "info": s[7], "entsize": s[9],
             })
+
+    def _extract_symbols(self):
+        """Extract function symbols and dynamic imports from SYMTAB/DYNSYM."""
+        sym_size = 16 if self.cls == ELFCLASS32 else 24
+        for i, sec in enumerate(self.sections):
+            name = sec["name"]
+            if sec["type"] not in ("SYMTAB", "DYNSYM"):
+                continue
+            link = int(sec.get("link") or 0)
+            if link >= len(self.sections):
+                continue
+            strsec = self.sections[link]
+            ssoff = int(strsec.get("offset") or 0)
+            entsize = int(sec.get("entsize") or 0) or sym_size
+            if entsize <= 0:
+                continue
+            off = int(sec.get("offset") or 0)
+            size = int(sec.get("size") or 0)
+            is_dyn = name == ".dynsym"
+            for k in range(size // entsize):
+                po = off + k * entsize
+                if po + sym_size > len(self.data):
+                    break
+                info_entry = None
+                if self.cls == ELFCLASS64:
+                    name_i, info, other, shndx, value, symsz = struct.unpack_from(
+                        self.endian + "IBBHQQ", self.data, po)
+                else:
+                    name_i, info, other, shndx, value, symsz = struct.unpack_from(
+                        self.endian + "IBBHII", self.data, po)
+                sym_name = _cstr(self.data, ssoff + name_i) if ssoff + name_i < len(self.data) else ""
+                if not sym_name:
+                    continue
+                stype = info & 0xF
+                bind = info >> 4
+                if shndx == SHN_UNDEF:
+                    if is_dyn and sym_name not in self.imports:
+                        self.imports.append(sym_name)
+                    continue
+                if stype == STT_FUNC:
+                    self.symbols.append({
+                        "name": sym_name, "value": value, "size": symsz,
+                        "section": name, "bind": bind,
+                    })
+
+    def _extract_needed_libs(self):
+        """Extract DT_NEEDED entries from the .dynamic section."""
+        e = self.endian
+        dyn = next((s for s in self.sections if s["type"] == "DYNAMIC"), None)
+        strsec = next((s for s in self.sections if s["name"] == ".dynstr"), None)
+        if dyn is None or strsec is None:
+            return
+        off = int(dyn.get("offset") or 0)
+        size = int(dyn.get("size") or 0)
+        sstr = int(strsec.get("offset") or 0)
+        entsize = 16 if self.cls == ELFCLASS64 else 8
+        for i in range(size // entsize):
+            po = off + i * entsize
+            if po + entsize > len(self.data):
+                break
+            if self.cls == ELFCLASS64:
+                tag, val = struct.unpack_from(e + "QQ", self.data, po)
+            else:
+                tag, val = struct.unpack_from(e + "II", self.data, po)
+            if tag == DT_NULL:
+                break
+            if tag == DT_NEEDED:
+                lib = _cstr(self.data, sstr + val) if sstr + val < len(self.data) else ""
+                if lib and lib not in self.needed_libs:
+                    self.needed_libs.append(lib)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +320,7 @@ class PEParser:
             if off + 40 > len(self.data):
                 break
             name_raw = self.data[off:off + 8]
-            name = name_raw.split(b'\x00')[0].decode("ascii", errors="replace")
+            name = name_raw.split(b"\x00")[0].decode("ascii", errors="replace")
             vsize = struct.unpack_from("<I", self.data, off + 8)[0]
             vaddr = struct.unpack_from("<I", self.data, off + 12)[0]
             raw_size = struct.unpack_from("<I", self.data, off + 16)[0]
@@ -250,6 +338,18 @@ class PEParser:
         if ptr + size <= len(self.data):
             return self.data[ptr:ptr + size]
         return b""
+
+    def extract_imports(self):
+        """Scan recognizable import strings inside the PE image."""
+        text = self.data.decode("latin-1")
+        candidates = [
+            "VirtualAlloc", "VirtualProtect", "WriteProcessMemory",
+            "CreateRemoteThread", "NtUnmapViewOfSection", "CreateProcessA",
+            "GetProcAddress", "LoadLibraryA", "CryptEncrypt", "CryptGenKey",
+            "urlmon.dll", "ws2_32.dll", "kernel32.dll", "user32.dll",
+        ]
+        self.imports = [c for c in candidates if c in text]
+        return self.imports
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +468,7 @@ def build_sample_elf(name_bytes, text_size=512, rodata_size=256, data_size=128):
         struct.pack_into("<I", sec_headers, off + 4, typ)
         struct.pack_into("<Q", sec_headers, off + 8, flags)
         struct.pack_into("<Q", sec_headers, off + 16, addr)
+        struct.pack_into("<I", sec_headers, off + 48, 1)  # addralign
         if name == ".bss":
             struct.pack_into("<Q", sec_headers, off + 24, 0)
             struct.pack_into("<Q", sec_headers, off + 32, 0)
@@ -390,8 +491,65 @@ def build_sample_elf(name_bytes, text_size=512, rodata_size=256, data_size=128):
 
 
 # ---------------------------------------------------------------------------
-# Analysis functions
+# Recon model
 # ---------------------------------------------------------------------------
+def section_entropies(parser, data):
+    out = []
+    for s in parser.sections:
+        if isinstance(parser, ELFParser):
+            size = s.get("size", 0)
+            offset = s.get("offset", 0)
+        else:
+            size = s.get("raw_size", 0)
+            offset = s.get("raw_ptr", 0)
+        if size > 0 and offset > 0:
+            chunk = data[offset:offset + min(size, 65536)]
+            out.append({"name": s["name"], "entropy": round(shannon_entropy(chunk), 4)})
+    return out
+
+
+def build_recon(parser, data, source=None):
+    """Assemble a complete recon record for an ELF parser."""
+    if isinstance(parser, ELFParser):
+        kind = "elf"
+        imports = parser.imports
+        symbols = parser.symbols
+    else:
+        kind = "pe"
+        parser.extract_imports()
+        imports = parser.imports
+        symbols = []
+    strings = [{"offset": off, "s": s} for off, s in extract_strings(data, min_len=6) if not s.startswith((".", "@", "GCC", "GLIBC"))]
+    score = score_packer(parser.sections, data)
+    record = {
+        "tool": "binrecon-x1",
+        "format": kind,
+        "source": source,
+        "size": len(data),
+        "header": parser.header,
+        "sections": parser.sections,
+        "symbols": symbols,
+        "imports": imports,
+        "needed_libs": getattr(parser, "needed_libs", []),
+        "entropy": section_entropies(parser, data),
+        "strings": strings[:200],
+        "packer_score": round(score, 4),
+        "string_count": len(strings),
+    }
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Analysis print functions
+# ---------------------------------------------------------------------------
+def section_flag_string(flags):
+    out = ""
+    for bit, char in SHT_FLAGS.items():
+        if flags & bit:
+            out += char
+    return out
+
+
 def analyze_elf(data):
     """Analyze an ELF binary."""
     parser = ELFParser(data)
@@ -403,14 +561,20 @@ def analyze_elf(data):
     print(f"  Entry:    0x{h['entry']:x}")
     print(f"  Sections: {h['shnum']}")
     print(f"\n[Sections]")
-    print(f"  {'Name':<16} {'Type':<14} {'Addr':<18} {'Size':<10} {'Flags'}")
-    print(f"  {'-'*70}")
+    print(f"  {'Name':<16} {'Type':<10} {'Addr':<18} {'Size':<8} {'Flags'}")
+    print(f"  {'-'*64}")
     for s in parser.sections:
-        flags = ""
-        for bit, char in SHT_FLAGS.items():
-            if s["flags"] & bit:
-                flags += char
-        print(f"  {s['name']:<16} {s['type']:<14} 0x{s['addr']:012x}  {s['size']:<10} {flags}")
+        print(f"  {s['name']:<16} {s['type']:<10} 0x{s['addr']:012x}  {s['size']:<8} {section_flag_string(s['flags'])}")
+    print(f"\n[Symbols ({len(parser.symbols)})]")
+    for s in parser.symbols[:25]:
+        print(f"  0x{s['value']:012x}  {s['name']}")
+    if len(parser.symbols) > 25:
+        print(f"  ... and {len(parser.symbols) - 25} more")
+    print(f"\n[Imports ({len(parser.imports)})]")
+    print(f"  {', '.join(parser.imports) if parser.imports else '(none)'}")
+    if parser.needed_libs:
+        print(f"\n[Needed Libraries]")
+        print(f"  {', '.join(parser.needed_libs)}")
     print(f"\n[Section Entropy]")
     for s in parser.sections:
         if s["size"] > 0 and s["offset"] > 0:
@@ -435,15 +599,11 @@ def analyze_pe(data):
     print(f"  Entry:       0x{h['entry']:x}")
     print(f"  Image Base:  0x{h['image_base']:x}")
     print(f"\n[Sections]")
-    print(f"  {'Name':<10} {'VAddr':<12} {'VSize':<10} {'RawPtr':<10} {'RawSize':<10} {'Chars'}")
-    print(f"  {'-'*60}")
+    print(f"  {'Name':<10} {'VAddr':<12} {'VSize':<8} {'RawPtr':<8} {'RawSize':<8}")
+    print(f"  {'-'*52}")
     for s in parser.sections:
-        char_strs = []
-        for bit, name in PE_SEC_CHARS:
-            if s["characteristics"] & bit:
-                char_strs.append(name)
         print(f"  {s['name']:<10} 0x{s['vaddr']:08x}  0x{s['vsize']:06x}  "
-              f"0x{s['raw_ptr']:06x}  0x{s['raw_size']:06x}  {','.join(char_strs[:3])}")
+              f"0x{s['raw_ptr']:06x}  0x{s['raw_size']:06x}")
     print(f"\n[Section Entropy]")
     for s in parser.sections:
         sd = parser.get_section_data(s)
@@ -468,7 +628,7 @@ def run_string_extraction(data, min_len=4):
 
 
 def run_patch_diff(data_a, data_b, label_a="A", label_b="B"):
-    """Compare two binaries section-by-section."""
+    """Compare two binaries byte-wise."""
     print(f"\n[Patch Diff]")
     print(f"  File {label_a}: {len(data_a)} bytes")
     print(f"  File {label_b}: {len(data_b)} bytes")
@@ -494,111 +654,170 @@ def run_patch_diff(data_a, data_b, label_a="A", label_b="B"):
 
 
 # ---------------------------------------------------------------------------
-# Demo
+# Reports
 # ---------------------------------------------------------------------------
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] != "--demo":
-        parser = argparse.ArgumentParser(description="X1 - Binary Recon Tool")
-        sub = parser.add_subparsers(dest="command")
-
-        p_analyze = sub.add_parser("analyze", help="Analyze a binary file")
-        p_analyze.add_argument("file", help="Path to binary file")
-
-        p_strings = sub.add_parser("strings", help="Extract strings")
-        p_strings.add_argument("file", help="Path to binary file")
-        p_strings.add_argument("--minlen", type=int, default=4, help="Minimum string length")
-
-        p_diff = sub.add_parser("diff", help="Diff two binaries")
-        p_diff.add_argument("file_a", help="First binary")
-        p_diff.add_argument("file_b", help="Second binary")
-
-        args = parser.parse_args()
-
-        if args.command == "analyze":
-            data = open(args.file, "rb").read()
-            if data[:4] == ELFMAG:
-                analyze_elf(data)
-            elif data[:2] == PE_MAGIC:
-                analyze_pe(data)
-            else:
-                print("Unknown format")
-        elif args.command == "strings":
-            data = open(args.file, "rb").read()
-            run_string_extraction(data, args.minlen)
-        elif args.command == "diff":
-            a = open(args.file_a, "rb").read()
-            b = open(args.file_b, "rb").read()
-            run_patch_diff(a, b, os.path.basename(args.file_a), os.path.basename(args.file_b))
-    else:
-        run_demo()
+def report_dir(root=None):
+    base = root or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    path = os.path.join(base, "reports")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-def run_demo():
-    print("=== X1 - Binary Recon Tool (binrecon) ===")
+def write_recon(record, out_path=None):
+    out_path = out_path or os.path.join(report_dir(), f"recon_{sanitize(record.get('source', 'binary'))}.json")
+    with open(out_path, "w") as f:
+        json.dump(record, f, indent=2)
+    return out_path
 
-    # Build two sample ELF-like buffers
-    elf_a = build_sample_elf(b"sample_a", text_size=1024, rodata_size=512, data_size=256)
-    elf_b = build_sample_elf(b"sample_b", text_size=1024, rodata_size=512, data_size=256)
 
-    # Modify elf_b slightly for diff demonstration
-    elf_b_arr = bytearray(elf_b)
-    for i in range(200, 248):
-        if i < len(elf_b_arr):
-            elf_b_arr[i] = 0xCC
-    elf_b = bytes(elf_b_arr)
+def sanitize(name):
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in os.path.basename(name))
 
-    print(f"\n--- Analysis of Sample ELF-A ({len(elf_a)} bytes) ---")
-    analyze_elf(elf_a)
-    run_string_extraction(elf_a, min_len=4)
 
-    print(f"\n--- Analysis of Sample ELF-B ({len(elf_b)} bytes) ---")
-    analyze_elf(elf_b)
+# ---------------------------------------------------------------------------
+# Sample build (gcc optional fallback to crafted fixture)
+# ---------------------------------------------------------------------------
+def build_sample_binary(dest_dir):
+    """Compile samples/vuln.c with gcc; fall back to a crafted ELF fixture."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    src = os.path.join(root, "samples", "vuln.c")
+    out = os.path.join(dest_dir, "vuln_target")
+    if os.path.exists(src):
+        r = subprocess.run(
+            ["gcc", "-o", out, "-fno-stack-protector", "-no-pie", "-fno-pie",
+             "-O0", "-U_FORTIFY_SOURCE", src],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and os.path.exists(out):
+            with open(out, "rb") as f:
+                return f.read(), "gcc-compiled samples/vuln.c"
+    return build_sample_elf(b"vuln_target", text_size=1024, rodata_size=512, data_size=256), "crafted ELF fixture (gcc unavailable)"
 
-    print(f"\n--- Patch Diff (A vs B) ---")
-    run_patch_diff(elf_a, elf_b, "sample_a", "sample_b")
 
-    # PE sample
-    pe_data = bytearray(512)
+def make_demo_pe():
+    """Synthetic PE64 fixture used to exercise the PE analysis path."""
+    pe_data = bytearray(1024)
     pe_data[0:2] = PE_MAGIC
-    struct.pack_into("<I", pe_data, 0x3c, 64)
-    pe_data[64:68] = PE_SIG
-    struct.pack_into("<H", pe_data, 68, 0x8664)  # x86_64
-    struct.pack_into("<H", pe_data, 70, 2)        # 2 sections
-    struct.pack_into("<I", pe_data, 76, 0)        # timestamp
-    struct.pack_into("<I", pe_data, 80, 0)        # sym table
-    struct.pack_into("<I", pe_data, 84, 0)        # num syms
-    struct.pack_into("<H", pe_data, 88, 240)      # opt hdr size
-    struct.pack_into("<H", pe_data, 90, 0x0022)   # characteristics
-    struct.pack_into("<H", pe_data, 88, 0)
-    opt_off = 64 + 4
-    struct.pack_into("<H", pe_data, opt_off, 0x20b)  # PE64
-    struct.pack_into("<I", pe_data, opt_off + 16, 0x1000)  # entry
-    struct.pack_into("<Q", pe_data, opt_off + 24, 0x140000000)  # image base
+    pe_off = 64
+    struct.pack_into("<I", pe_data, 0x3c, pe_off)
+    pe_data[pe_off:pe_off + 4] = PE_SIG
+    struct.pack_into("<H", pe_data, pe_off + 4, 0x8664)
+    struct.pack_into("<H", pe_data, pe_off + 6, 1)
+    struct.pack_into("<H", pe_data, pe_off + 20, 240)
+    opt_off = pe_off + 24
+    struct.pack_into("<H", pe_data, opt_off, 0x20b)
+    struct.pack_into("<I", pe_data, opt_off + 16, 0x1000)
+    struct.pack_into("<Q", pe_data, opt_off + 24, 0x140000000)
     sec_off = opt_off + 240
-    text_name = b".text\x00\x00\x00"
-    pe_data[sec_off:sec_off + 8] = text_name
-    struct.pack_into("<I", pe_data, sec_off + 8, 0x1000)   # vsize
-    struct.pack_into("<I", pe_data, sec_off + 12, 0x1000)  # vaddr
-    struct.pack_into("<I", pe_data, sec_off + 16, 0x200)   # raw size
-    struct.pack_into("<I", pe_data, sec_off + 20, 0x200)   # raw ptr
-    struct.pack_into("<I", pe_data, sec_off + 36, 0x60000020)  # chars
-    data_name = b".data\x00\x00\x00"
-    sec2 = sec_off + 40
-    pe_data[sec2:sec2 + 8] = data_name
-    struct.pack_into("<I", pe_data, sec2 + 8, 0x1000)
-    struct.pack_into("<I", pe_data, sec2 + 12, 0x2000)
-    struct.pack_into("<I", pe_data, sec2 + 16, 0x100)
-    struct.pack_into("<I", pe_data, sec2 + 20, 0x400)
-    struct.pack_into("<I", pe_data, sec2 + 36, 0xC0000040)
-    pe_data[0x200:0x300] = bytes(range(256)) * 1
+    pe_data[sec_off:sec_off + 8] = b".text\x00\x00\x00"
+    struct.pack_into("<I", pe_data, sec_off + 8, 0x1000)
+    struct.pack_into("<I", pe_data, sec_off + 12, 0x1000)
+    struct.pack_into("<I", pe_data, sec_off + 16, 0x300)
+    struct.pack_into("<I", pe_data, sec_off + 20, 0x300)
+    struct.pack_into("<I", pe_data, sec_off + 36, 0x60000020)
+    pe_data[0x300:0x600] = bytes(0x41 if i % 3 else 0x00 for i in range(0x300))
+    return bytes(pe_data)
 
-    print(f"\n--- PE Analysis (synthetic, {len(pe_data)} bytes) ---")
-    try:
-        analyze_pe(bytes(pe_data))
-    except Exception as e:
-        print(f"  PE parse: {e}")
 
-    print("\n=== Demo complete ===")
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="X1 - Binary Recon Tool (binrecon): real ELF/PE parsing, "
+                    "symbols, dynamic imports, entropy, strings, patch-diff",
+        epilog="Authorized lab use only. Targets must be your own binaries.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_demo = sub.add_parser("demo", help="Offline end-to-end verification (exit 0)")
+    p_demo.add_argument("--no-gcc", action="store_true", help="Skip gcc compilation step")
+
+    p_analyze = sub.add_parser("analyze", help="Analyze a binary file to stdout + recon JSON")
+    p_analyze.add_argument("file", help="Path to binary file")
+    p_analyze.add_argument("--report", default=None, help="Output JSON path (default: reports/recon_<name>.json)")
+
+    p_strings = sub.add_parser("strings", help="Extract strings from a binary")
+    p_strings.add_argument("file", help="Path to binary file")
+    p_strings.add_argument("--minlen", type=int, default=4, help="Minimum string length")
+
+    p_diff = sub.add_parser("diff", help="Diff two binaries")
+    p_diff.add_argument("file_a", help="First binary")
+    p_diff.add_argument("file_b", help="Second binary")
+
+    args = parser.parse_args(argv)
+
+    if args.command in (None, "demo"):
+        return run_demo(no_gcc=getattr(args, "no_gcc", False))
+
+    if args.command == "analyze":
+        data = open(args.file, "rb").read()
+        if data[:4] == ELFMAG:
+            parser_obj = analyze_elf(data)
+        elif data[:2] == PE_MAGIC:
+            parser_obj = analyze_pe(data)
+        else:
+            print("Unknown format — expected ELF or PE.")
+            return 1
+        record = build_recon(parser_obj, data, source=args.file)
+        out = write_recon(record, args.report)
+        print(f"\n[Recon JSON] {out}")
+        return 0
+
+    if args.command == "strings":
+        data = open(args.file, "rb").read()
+        run_string_extraction(data, args.minlen)
+        return 0
+
+    if args.command == "diff":
+        a = open(args.file_a, "rb").read()
+        b = open(args.file_b, "rb").read()
+        run_patch_diff(a, b, os.path.basename(args.file_a), os.path.basename(args.file_b))
+        return 0
+
+    parser.print_help()
+    return 0
+
+
+def run_demo(no_gcc=False):
+    print("=== X1 - Binary Recon Tool (binrecon) ===")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    build_dir = os.path.join(root, "builds")
+    os.makedirs(build_dir, exist_ok=True)
+
+    if no_gcc:
+        print("\n[step 1] Skipping gcc (--no-gcc); using crafted ELF fixture")
+        elf_data = build_sample_elf(b"vuln_target", text_size=1024, rodata_size=512, data_size=256)
+        source = "crafted ELF fixture"
+    else:
+        print("\n[step 1] Compiling samples/vuln.c with gcc -fno-stack-protector -no-pie")
+        elf_data, source = build_sample_binary(root)
+        print(f"  binary: builds/vuln_target ({len(elf_data)} bytes)")
+
+    print(f"\n[step 2] ELF parse of real binary ({len(elf_data)} bytes)")
+    parser_obj = analyze_elf(elf_data)
+    record = build_recon(parser_obj, elf_data, source=source)
+    out = write_recon(record, os.path.join(report_dir(root), "recon_vuln_target.json"))
+    print(f"\n[step 3] Recon JSON -> {out}")
+
+    import json as _json
+    with open(out) as f:
+        recon = _json.load(f)
+    assert recon["format"] == "elf"
+    assert len(recon["sections"]) > 0
+    print(f"  verified: {len(recon['sections'])} sections, {len(recon['symbols'])} symbols, "
+          f"{len(recon['imports'])} imports parsed")
+
+    print(f"\n[step 4] Strings")
+    run_string_extraction(elf_data, min_len=4)
+
+    print(f"\n--- PE analysis (synthetic fixture) ---")
+    pe = make_demo_pe()
+    pe_parser = analyze_pe(pe)
+    pe_record = build_recon(pe_parser, pe, source="synthetic PE64 fixture")
+    write_recon(pe_record, os.path.join(report_dir(root), "recon_pe_fixture.json"))
+
+    print("\n=== Demo complete (exit 0) ===")
     return 0
 
 

@@ -4,6 +4,7 @@ import unittest
 import sys
 import os
 import struct
+import json
 import subprocess
 import tempfile
 
@@ -12,6 +13,7 @@ from binrecon import (
     ELFParser, PEParser, shannon_entropy, entropy_bar, extract_strings,
     score_packer, build_sample_elf, analyze_elf, analyze_pe,
     run_string_extraction, run_patch_diff, ELFMAG, PE_MAGIC, PE_SIG,
+    build_recon, write_recon, build_sample_binary, report_dir, sanitize,
 )
 
 
@@ -219,6 +221,114 @@ class TestCompiledBinaryAnalysis(unittest.TestCase):
             self.skipTest("gcc not available")
         data = open(self.binary_path, "rb").read()
         self.assertIn(b"win_function", data)
+
+
+class TestSymbolsAndImports(unittest.TestCase):
+    """Parse real symbols / dynamic imports from the gcc-compiled ELF."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sample_dir = os.path.join(os.path.dirname(__file__), "..", "samples")
+        src = os.path.join(cls.sample_dir, "vuln.c")
+        out = os.path.join(os.path.dirname(__file__), "..", "builds", "vuln_target")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        cls.parser = None
+        if os.path.exists(src):
+            try:
+                subprocess.run(
+                    ["gcc", "-o", out, "-fno-stack-protector", "-no-pie", "-O0", src],
+                    capture_output=True, timeout=10,
+                )
+                if os.path.exists(out):
+                    with open(out, "rb") as f:
+                        cls.parser = ELFParser(f.read())
+            except Exception:
+                pass
+
+    def test_function_symbols(self):
+        if self.parser is None:
+            self.skipTest("gcc not available")
+        names = [s["name"] for s in self.parser.symbols]
+        self.assertIn("win_function", names)
+        self.assertIn("vulnerable", names)
+        self.assertIn("main", names)
+
+    def test_dynamic_imports(self):
+        if self.parser is None:
+            self.skipTest("gcc not available")
+        self.assertIn("strcpy", self.parser.imports)
+        self.assertIn("printf", self.parser.imports)
+
+    def test_needed_libs(self):
+        if self.parser is None:
+            self.skipTest("gcc not available")
+        self.assertIn("libc.so.6", self.parser.needed_libs)
+
+    def test_symbol_value_is_address(self):
+        if self.parser is None:
+            self.skipTest("gcc not available")
+        win = next(s for s in self.parser.symbols if s["name"] == "win_function")
+        self.assertGreater(win["value"], 0x400000)
+        self.assertLess(win["value"], 0x500000)
+
+
+class TestBuildRecon(unittest.TestCase):
+    def test_recon_record_keys(self):
+        data = build_sample_elf(b"t")
+        parser = ELFParser(data)
+        rec = build_recon(parser, data, source="sample")
+        for key in ("format", "sections", "symbols", "imports",
+                    "needed_libs", "entropy", "strings", "packer_score"):
+            self.assertIn(key, rec)
+        self.assertEqual(rec["format"], "elf")
+
+    def test_recon_pe_record(self):
+        pe = bytearray(1024)
+        pe[0:2] = PE_MAGIC
+        pe_off = 64
+        struct.pack_into("<I", pe, 0x3c, pe_off)
+        pe[pe_off:pe_off + 4] = PE_SIG
+        struct.pack_into("<H", pe, pe_off + 4, 0x8664)
+        struct.pack_into("<H", pe, pe_off + 6, 1)
+        struct.pack_into("<H", pe, pe_off + 20, 240)
+        opt_off = pe_off + 24
+        struct.pack_into("<H", pe, opt_off, 0x20b)
+        sec_off = opt_off + 240
+        pe[sec_off:sec_off + 8] = b".text\x00\x00\x00"
+        struct.pack_into("<I", pe, sec_off + 16, 0x100)
+        struct.pack_into("<I", pe, sec_off + 20, 0x100)
+        parser = PEParser(bytes(pe))
+        rec = build_recon(parser, bytes(pe), source="pe.bin")
+        self.assertEqual(rec["format"], "pe")
+
+    def test_write_recon_json(self):
+        data = build_sample_elf(b"t")
+        parser = ELFParser(data)
+        rec = build_recon(parser, data, source="sample")
+        out_dir = tempfile.mkdtemp()
+        out = write_recon(rec, os.path.join(out_dir, "recon_test.json"))
+        with open(out) as f:
+            loaded = json.load(f)
+        self.assertEqual(loaded["format"], "elf")
+        self.assertGreater(len(loaded["sections"]), 0)
+
+    def test_sanitize(self):
+        self.assertEqual(sanitize("/a/b/x#.bin"), "x_.bin")
+
+
+class TestBuildSampleBinary(unittest.TestCase):
+    def test_compiles_when_gcc_available(self):
+        data, source = build_sample_binary(tempfile.mkdtemp())
+        self.assertEqual(data[:4], ELFMAG)
+        self.assertGreater(len(data), 100)
+
+    def test_demo_exit_zero(self):
+        r = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "firmware", "binrecon.py"), "demo", "--no-gcc"],
+            capture_output=True, text=True, cwd=os.path.join(os.path.dirname(__file__), ".."),
+        )
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Demo complete", r.stdout)
 
 
 if __name__ == "__main__":
