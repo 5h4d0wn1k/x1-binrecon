@@ -113,9 +113,9 @@ class ELFParser:
             "machine": EM_MACHINES.get(hdr[1], f"0x{hdr[1]:x}"),
             "entry": hdr[2], "phoff": hdr[3], "shoff": hdr[4],
             "ehsize": hdr[5], "phentsize": hdr[6], "phnum": hdr[7],
-            "shentsize": hdr[8], "shnum": hdr[9], "shstrndx": hdr[10],
+            "shentsize": hdr[10], "shnum": hdr[11], "shstrndx": hdr[12],
         }
-        self._parse_sections32(hdr[8], hdr[9], hdr[10], hdr[4])
+        self._parse_sections32(hdr[10], hdr[11], hdr[12], hdr[4])
 
     def _parse64(self):
         e = self.endian
@@ -125,19 +125,21 @@ class ELFParser:
             "machine": EM_MACHINES.get(hdr[1], f"0x{hdr[1]:x}"),
             "entry": hdr[3], "phoff": hdr[4], "shoff": hdr[5],
             "ehsize": hdr[6], "phentsize": hdr[7], "phnum": hdr[8],
-            "shentsize": hdr[9], "shnum": hdr[10], "shstrndx": hdr[11],
+            "shentsize": hdr[10], "shnum": hdr[11], "shstrndx": hdr[12],
         }
-        self._parse_sections64(hdr[9], hdr[10], hdr[11], hdr[5])
+        self._parse_sections64(hdr[10], hdr[11], hdr[12], hdr[5])
 
     def _parse_sections32(self, shentsize, shnum, shstrndx, shoff):
         if shnum == 0 or shoff == 0:
             return
-        strtab_off = shoff + shstrndx * shentsize + 16
-        if strtab_off + 4 <= len(self.data):
-            strtab_size = struct.unpack_from(self.endian + "I", self.data, strtab_off)[0]
-        else:
-            strtab_size = 0
-        strtab_start = struct.unpack_from(self.endian + "I", self.data, strtab_off + 4)[0]
+        strtab_hdr_off = shoff + shstrndx * shentsize
+        if strtab_hdr_off + 24 > len(self.data):
+            return
+        # ELF32 section header: sh_offset at +16, sh_size at +20
+        strtab_start = struct.unpack_from(self.endian + "I", self.data, strtab_hdr_off + 16)[0]
+        strtab_size = struct.unpack_from(self.endian + "I", self.data, strtab_hdr_off + 20)[0]
+        if strtab_size == 0 or strtab_start + strtab_size > len(self.data):
+            return
         strtab = self.data[strtab_start:strtab_start + strtab_size]
         for i in range(shnum):
             off = shoff + i * shentsize
@@ -145,7 +147,10 @@ class ELFParser:
                 break
             s = struct.unpack_from(self.endian + "IIIIIIII", self.data, off)
             name_idx = s[0]
-            name = strtab[name_idx:strtab.index(b'\x00', name_idx)].decode("ascii", errors="replace") if name_idx < len(strtab) else ""
+            name = ""
+            if name_idx < len(strtab):
+                end = strtab.index(b'\x00', name_idx) if b'\x00' in strtab[name_idx:] else len(strtab)
+                name = strtab[name_idx:end].decode("ascii", errors="replace")
             self.sections.append({
                 "name": name, "type": SHT_TYPES.get(s[1], f"0x{s[1]:x}"),
                 "flags": s[2], "addr": s[3], "offset": s[4],
@@ -156,16 +161,17 @@ class ELFParser:
         if shnum == 0 or shoff == 0:
             return
         strtab_hdr_off = shoff + shstrndx * shentsize
-        if strtab_hdr_off + 24 > len(self.data):
+        if strtab_hdr_off + 64 > len(self.data):
             return
+        # ELF64 section header: sh_offset at byte 24, sh_size at byte 32
+        strtab_file_off = struct.unpack_from(self.endian + "Q", self.data, strtab_hdr_off + 24)[0]
         strtab_size = struct.unpack_from(self.endian + "Q", self.data, strtab_hdr_off + 32)[0]
-        strtab_off_field = struct.unpack_from(self.endian + "Q", self.data, strtab_hdr_off + 24)[0]
-        if strtab_off_field + strtab_size > len(self.data):
+        if strtab_size == 0 or strtab_file_off == 0 or strtab_file_off + strtab_size > len(self.data):
             return
-        strtab = self.data[strtab_off_field:strtab_off_field + strtab_size]
+        strtab = self.data[strtab_file_off:strtab_file_off + strtab_size]
         for i in range(shnum):
             off = shoff + i * shentsize
-            if off + shentsize > len(self.data):
+            if off + 64 > len(self.data):
                 break
             s = struct.unpack_from(self.endian + "IIQQQQIIQQ", self.data, off)
             name_idx = s[0]
@@ -176,8 +182,8 @@ class ELFParser:
             flags = s[3]
             self.sections.append({
                 "name": name, "type": SHT_TYPES.get(s[1], f"0x{s[1]:x}"),
-                "flags": flags, "addr": s[4], "offset": s[5],
-                "size": s[6], "ent_size": s[8],
+                "flags": s[2], "addr": s[3], "offset": s[4],
+                "size": s[5], "ent_size": s[8],
             })
 
 
@@ -342,7 +348,7 @@ def build_sample_elf(name_bytes, text_size=512, rodata_size=256, data_size=128):
     struct.pack_into("<H", header, 62, shstrndx)
 
     sections_layout = [
-        (".shstrtab", 1, 0, len(shstrtab), 0),
+        (".shstrtab", 1, 0, 0, len(shstrtab)),
         (".text", 1, 1 | 4, 0x400000, text_size),
         (".rodata", 1, 2, 0x401000, rodata_size),
         (".data", 1, 3, 0x402000, data_size),

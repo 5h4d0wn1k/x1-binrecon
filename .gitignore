@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+reports/
+logs/
+builds/
+*.jsonl
+*.o
+samples/vuln_test
+crash_*

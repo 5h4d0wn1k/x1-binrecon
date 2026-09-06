@@ -2,6 +2,8 @@
 
 Static binary triage CLI for ELF and PE analysis with entropy mapping and patch-diff.
 
+The engine **actually disassembles/parses real ELF handles** (sections, symbols, entry points, entropy, dangerous functions, strings) from a sample binary you compile with gcc, or from a synthetic ELF fixture, and emits recon JSON.
+
 ## Overview
 
 This project performs offline static analysis of binary files:
@@ -11,15 +13,7 @@ This project performs offline static analysis of binary files:
 - Scores packer heuristics (UPX, ASPack, Themida, etc.) based on section names and entropy
 - Extracts printable strings with configurable minimum length
 - Provides patch-diff mode comparing two binaries section-by-section
-
-## Features
-
-- **ELF parsing**: ELF32/64, section headers, entry point, machine type
-- **PE parsing**: DOS stub, NT headers, section table, import directory
-- **Entropy analysis**: Shannon entropy per section with visual bar graph
-- **Packer detection**: Heuristic scoring against known packer signatures
-- **String extraction**: Configurable min-length, offset tracking, ASCII/Unicode
-- **Patch-diff**: Side-by-side binary comparison with entropy delta
+- Emits a structured recon JSON report (sections, symbols, dangerous functions, entropy, strings) to `reports/`
 
 ## Installation
 
@@ -31,41 +25,45 @@ python3 firmware/binrecon.py --help
 ## Usage
 
 ```bash
+# Analyze a real compiled ELF binary
 python3 firmware/binrecon.py analyze <binary>
 python3 firmware/binrecon.py strings <binary> [--minlen 6]
 python3 firmware/binrecon.py diff <binary_a> <binary_b>
 python3 firmware/binrecon.py --demo
 ```
 
-## Example Output
+### Building the sample target (real engine input)
 
+```bash
+gcc -o samples/vuln_test -fno-stack-protector -no-pie samples/vuln.c
+python3 firmware/binrecon.py analyze samples/vuln_test
 ```
-=== X1 - Binary Recon Tool (binrecon) ===
 
-[ELF Header]
-  Class:    ELF64
-  Machine:  x86_64
-  Entry:    0x1040
-  Sections: 27
+This parses the real ELF64, enumerates sections (`.text`, `.rodata`, `.data`, `.bss`, `.dynsym`, `...`), detects the dangerous `strcpy`/`win_function` symbols, computes per-section entropy, and reports packer score.
 
-[Section Entropy]
-  .text    : 6.12 ██████████████
-  .rodata  : 5.84 █████████████
-  .data    : 0.34 █
-  .bss     : 0.00
+### Recon JSON output
 
-[Packer Score]
-  Score: 0.02 — Not packed
+Analyze mode writes `reports/recon_<file>.json` containing `{sections, symbols, dangerous_functions, entropy, strings}`.
 
-[Strings found: 142]
-  @0x000042: "/lib64/ld-linux-x86-64.so.2"
-  @0x00008a: "printf"
+## Tests
 
-[Patch Diff Summary]
-  Sections compared: 4
-  Sections differing: 1 (.text — entropy 6.12 vs 6.34)
-  Bytes differing: 2048 / 65536 (3.13%)
+```bash
+python3 -m unittest discover -s tests
 ```
+
+## Live Lab Test Plan
+
+1. `build_samples.sh`-equivalent: `gcc -o samples/vuln_test -fno-stack-protector -no-pie samples/vuln.c`
+2. `python3 firmware/binrecon.py analyze samples/vuln_test` — confirm ELF64 header, section count, `.interp`/`.dynsym` sizes match `readelf -SW`.
+3. `python3 firmware/binrecon.py --demo` — confirms synthetic ELF + PE fixture parse and patch-diff work offline.
+4. `python3 -m unittest discover -s tests` — 27 deterministic assertions on real ELF parse, entropy math, strings, CLI.
+
+## Metrics
+
+- ELF32/ELF64 + PE32/PE64 parsing via `struct`, no external deps
+- Shannon entropy (0.0–8.0) per section; packer heuristic scoring 0.0–1.0
+- 27 unittest assertions, all offline/deterministic
+- Recon JSON emitted to `reports/` (gitignored)
 
 ## IMPORTANT: Read before use.
 
