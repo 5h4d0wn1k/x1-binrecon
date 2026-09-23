@@ -3,114 +3,107 @@
 > or hold explicit written authorization to assess**. Unauthorized use is
 > prohibited and may be illegal. Read [ETHICS.md](ETHICS.md) and
 > [SCOPE.md](SCOPE.md) before use. Use at your own risk; **AS IS**, no warranty.
-# X1 — Binary Recon Tool — binrecon
 
-Static binary triage CLI for ELF and PE analysis with symbols, dynamic imports, entropy mapping and patch-diff.
+# X1 — Binary Recon Tool (binrecon)
 
-The engine **parses real ELF binaries** — sections, symbols (SYMTAB/DYNSYM), dynamic imports (DT_NEEDED + undefined dynsym), strings, per-section entropy — from a sample binary **you compile with `gcc`** (or from a crafted ELF fixture), and emits recon JSON to `reports/`.
+**Binary recon suite** by **5h4d0wn1k** for **malware triage and reverse-
+engineering education**: static analysis of ELF32/64 and PE32/64 binaries —
+headers, sections, symbol tables (SYMTAB/DYNSYM), dynamic imports and
+`DT_NEEDED` libraries, per-section Shannon entropy, packer heuristics, string
+extraction and patch-diff. Pure `struct`-based Python, no external
+dependencies.
 
-## Overview
+## Why static binary triage
 
-This project performs offline static analysis of binary files:
-- Parses ELF32/ELF64 headers and sections using pure `struct`
-- Parses symbol tables (`SYMTAB`/`DYNSYM`), exports functions with addresses, and enumerates dynamic imports + `DT_NEEDED` libraries
-- Parses PE DOS/NT headers, sections, and imports using pure `struct`
-- Computes per-section Shannon entropy map to identify encrypted/packed regions
-- Scores packer heuristics (UPX, ASPack, Themida, etc.) based on section names and entropy
-- Extracts printable strings with configurable minimum length
-- Provides patch-diff mode comparing two binaries region-by-region
-- Emits a structured recon JSON report (header, sections, symbols, imports, entropy, strings) to `reports/`
+Before a sample ever runs, a one-pass static recon answers the urgent
+questions: what platform is it, what does it import, is it packed and where
+is the interesting data? This tool turns those questions into a reproducible
+workflow — parse real ELF headers and sections, enumerate symbol tables and
+imports, map Shannon entropy per section to flag encrypted/packed regions,
+score packer heuristics and dump printable strings — then emit a structured
+recon JSON to `reports/`. Because there is no execution, analysis is safe and
+offline. Use it only on binaries you own or are authorized to analyze (e.g. a
+sample you compiled with `gcc`, or permitted malware in a sandbox) — see
+[ETHICS.md](ETHICS.md) and [SCOPE.md](SCOPE.md).
 
-## Installation
+## Features
+
+- **ELF parsing** — ELF32/ELF64 headers and sections via pure `struct`
+  (`ELFParser`).
+- **Symbols and imports** — functions with addresses from `SYMTAB`/`DYNSYM`,
+  plus dynamic imports and `DT_NEEDED` libraries from `.dynamic`.
+- **PE parsing** — DOS/NT headers, sections and imports via pure `struct`
+  (`PEParser`).
+- **Entropy mapping** — per-section Shannon entropy (0.0–8.0) with visual
+  bars to spot packed regions (`shannon_entropy`, `entropy_bar`).
+- **Packer heuristics** — 0.0–1.0 scoring (UPX/ASPack/Themida-style indicators)
+  based on section names and entropy (`score_packer`).
+- **String extraction** — printable strings with configurable minimum length.
+- **Patch-diff** — region-by-region byte comparison of two binaries.
+- **Recon JSON** — header, sections, symbols, imports, entropy and strings
+  written to `reports/` (gitignored).
+
+## Quickstart
+
+Prerequisites: Python 3.8+ (standard library only). `gcc` is optional and only
+needed for the compiled-sample demo.
 
 ```bash
-# No external dependencies required — Python 3.8+ standard library only
+# Help
 python3 firmware/binrecon.py --help
-```
 
-## Usage
-
-```bash
 # Analyze a real compiled ELF binary (writes reports/recon_<name>.json)
 python3 firmware/binrecon.py analyze <binary> [--report OUT.json]
-python3 firmware/binrecon.py strings <binary> [--minlen 6]
+
+# Dump printable strings
+python3 firmware/binrecon.py strings <binary> --minlen 6
+
+# Region-by-region diff of two binaries
 python3 firmware/binrecon.py diff <binary_a> <binary_b>
-# Offline end-to-end demo: compiles samples/vuln.c, parses real ELF, emits recon JSON
+
+# Offline end-to-end demo: compiles samples/vuln.c, parses a real ELF, emits JSON
 python3 firmware/binrecon.py demo
-python3 firmware/binrecon.py demo --no-gcc   # uses crafted ELF fixture, no compiler needed
+python3 firmware/binrecon.py demo --no-gcc   # crafted ELF fixture, no compiler
+
+# Run the test suite (37 deterministic offline tests)
+python3 -m unittest discover -s tests
 ```
 
-### Building the sample target (real engine input)
+### Build and analyze the bundled sample
 
 ```bash
 gcc -o samples/vuln_test -fno-stack-protector -no-pie samples/vuln.c
 python3 firmware/binrecon.py analyze samples/vuln_test
 ```
 
-The `analyze` output enumerates sections (`.text`, `.rodata`, `.dynamic`, `.dynsym`, ...),
-the function symbols (`win_function`, `vulnerable`, `main`), the dynamic imports
-(`strcpy`, `printf`, `__libc_start_main`), needed libraries (`libc.so.6`), and
-per-section entropy, then writes `reports/recon_vuln_test.json`.
+The `analyze` output enumerates sections (`.text`, `.rodata`, `.dynamic`,
+`.dynsym`), the function symbols (`win_function`, `vulnerable`, `main`),
+dynamic imports (`strcpy`, `printf`, `__libc_start_main`), needed libraries
+(`libc.so.6`) and per-section entropy — cross-check against `readelf -SW`.
 
-## Tests
+## Project structure
 
-```bash
-python3 -m unittest discover -s tests
+```
+firmware/binrecon.py   # ELF/PE parsers, entropy, packer score, CLI engine
+samples/vuln.c         # gcc-compilable sample target for real-ELF tests
+tests/                 # 37 deterministic assertions on real ELF + fixtures
 ```
 
-## Live Lab Test Plan
+## Documentation
 
-1. Build the real sample: `gcc -o samples/vuln_test -fno-stack-protector -no-pie samples/vuln.c`
-2. `python3 firmware/binrecon.py analyze samples/vuln_test` — confirm ELF64 header, section count and `.dynsym`/`.symtab` sizes match `readelf -SW`.
-3. Verify the symbols panel lists `win_function`/`vulnerable`/`main` and imports list `strcpy`/`printf`.
-4. `python3 firmware/binrecon.py demo` — compiles, parses the real ELF, writes `reports/recon_vuln_target.json`, then analyzes a synthetic PE fixture; exits 0.
-5. `python3 -m unittest discover -s tests` — 37 deterministic assertions on real ELF parse, symbols/imports, entropy math, strings, JSON reports, CLI.
+- [ETHICS.md](ETHICS.md) — acceptable and prohibited use.
+- [SCOPE.md](SCOPE.md) — authorized analysis scope.
+- [SECURITY.md](SECURITY.md) — responsible disclosure.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide.
 
-## Metrics
+## Contributing
 
-- ELF32/ELF64 + PE32/PE64 parsing via `struct`, no external deps
-- Symbols parsed from `SYMTAB`/`DYNSYM`; dynamic imports + `DT_NEEDED` libraries extracted from real ELFs
-- Shannon entropy (0.0–8.0) per section; packer heuristic scoring 0.0–1.0
-- 37 unittest assertions, all offline/deterministic (real gcc-compiled ELF included)
-- Recon JSON emitted to `reports/` (gitignored)
-
-## IMPORTANT: Read before use.
-
-This project is provided for **educational and authorized security testing purposes only**.
-
-### Authorization Requirements
-- You MUST have explicit written permission from the system owner before using this tool
-- Unauthorized analysis of binaries may violate applicable laws
-- This tool should ONLY be used on binaries you own or have written authorization to analyze
-
-### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **Copyright Act**: Reverse engineering may be restricted by license agreements
-- **State Laws**: Many states have additional computer crime statutes
-- **EU Directive 2009/24/EC**: Reverse engineering of software may have legal restrictions
-
-### Acceptable Use
-- Analyzing your own binaries for security assessment
-- Authorized penetration testing with written scope
-- Academic research in controlled lab environments
-- Security education and training
-- Malware analysis in isolated sandboxes
-
-### Prohibited Use
-- Analyzing proprietary software without authorization
-- Reverse engineering to circumvent copy protection
-- Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
-
-### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
-
-### Responsible Disclosure
-If you discover vulnerabilities using this tool, follow responsible disclosure practices:
-1. Report to the vendor/owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+More file formats, entropy heuristics and packer fingerprints are welcome.
+Open an issue or PR against the default branch; keep contributions scoped to
+educational static-analysis tooling.
 
 ## License
 
-MIT
+MIT — full legal shield in [LICENSE](LICENSE). Educational, authorization-
+required software for analyzing binaries you own or are explicitly permitted
+to inspect.
